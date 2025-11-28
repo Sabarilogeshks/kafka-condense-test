@@ -14,7 +14,7 @@ const TOKEN_ENDPOINT =
   "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.auth.marketingcloudapis.com/v2/token";
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
-const DEFAULT_EMAIL = "schetan@royalenfield.com";
+const DEFAULT_EMAIL = "kaliappan_ext@royalenfield.com";
 
 let cachedToken = null;
 let tokenExpiry = null;
