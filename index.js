@@ -4,286 +4,185 @@ const axios = require("axios");
 const express = require("express");
 const bodyParser = require("body-parser");
 
-// Logging helper
-const log = (type, msg, obj = null) => {
-  const ts = new Date().toISOString();
-  if (obj) {
-    console.log(`[${ts}] [${type}] ${msg}`, obj);
-  } else {
-    console.log(`[${ts}] [${type}] ${msg}`);
+// ---------- Logging Setup ----------
+const log = (...msg) => console.log(new Date().toISOString(), ...msg);
+
+// Kafka logging topic
+const LOG_TOPIC = "notification-logs";
+
+// Kafka setup
+const kafka = new Kafka({
+  clientId: "notification-service",
+  brokers: [process.env.KAFKA_BROKER || "localhost:9092"],
+});
+
+const consumer = kafka.consumer({ groupId: "notification-group" });
+const logProducer = kafka.producer();
+const otpGenerator = () => Math.floor(100000 + Math.random() * 900000).toString();
+
+// Initialize log producer
+(async () => {
+  try {
+    await logProducer.connect();
+    log("Kafka Log Producer connected");
+  } catch (err) {
+    log("❌ Kafka Log Producer connection failed:", err.message);
   }
-};
+})();
 
-const KAFKA_BROKER = process.env.KAFKA_BROKER || "localhost:9092";
-const SOURCE_TOPIC = process.env.SOURCE_TOPIC || "notification-topic";
-const EMAIL_API_ENDPOINT =
-  "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.rest.marketingcloudapis.com/messaging/v1/email/messages";
-const SMS_API_ENDPOINT =
-  "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.rest.marketingcloudapis.com/sms/v1/messageContact/NzcwMzo3ODow/send";
-const TOKEN_ENDPOINT =
-  "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.auth.marketingcloudapis.com/v2/token";
+// Logging function → Kafka + console fallback
+async function logToKafka(level, message, meta = {}) {
+  const event = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...meta,
+  };
 
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-const DEFAULT_EMAIL = "kaliappan_ext@royalenfield.com";
+  try {
+    await logProducer.send({
+      topic: LOG_TOPIC,
+      messages: [{ value: JSON.stringify(event) }],
+    });
+  } catch (err) {
+    log("⚠ Failed to push log to Kafka:", err.message);
+    log("Fallback Log:", event);
+  }
+}
+
+// ---------- Salesforce Marketing Cloud Credentials ----------
+const TOKEN_ENDPOINT = "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.auth.marketingcloudapis.com/v2/token";
+const EMAIL_API_ENDPOINT = "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.rest.marketingcloudapis.com/messaging/v1/email/messages";
+const SMS_API_ENDPOINT = "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.rest.marketingcloudapis.com/sms/v1/messageContact/NzcwMzo3ODow/send";
 
 let cachedToken = null;
 let tokenExpiry = null;
 
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+// Token Handler
+async function getAccessToken() {
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) return cachedToken;
 
-const getAccessToken = async (retryCount = 0) => {
+  const body = {
+    grant_type: "client_credentials",
+    client_id: process.env.CLIENT_ID,
+    client_secret: process.env.CLIENT_SECRET,
+  };
+
   try {
-    if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) {
-      return cachedToken;
-    }
-
-    if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET) {
-      throw new Error("Missing CLIENT_ID or CLIENT_SECRET");
-    }
-
-    const response = await axios.post(
-      TOKEN_ENDPOINT,
-      {
-        grant_type: "client_credentials",
-        client_id: process.env.CLIENT_ID,
-        client_secret: process.env.CLIENT_SECRET,
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
-
+    const response = await axios.post(TOKEN_ENDPOINT, body);
     cachedToken = response.data.access_token;
     tokenExpiry = Date.now() + (response.data.expires_in - 1200) * 1000;
 
-    log("INFO", "New SFMC access token generated");
+    await logToKafka("INFO", "SFMC access token refreshed");
     return cachedToken;
-  } catch (error) {
-    log("ERROR", "Token fetch failed", error.toString());
-    if (retryCount < MAX_RETRIES) {
-      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-      return getAccessToken(retryCount + 1);
-    }
-    throw error;
-  }
-};
-
-// Kafka setup
-const kafka = new Kafka({ clientId: "notification-processor", brokers: [KAFKA_BROKER] });
-const consumer = kafka.consumer({ groupId: "notification-group" });
-
-const sendNotification = async (payload, isEmail = true) => {
-  try {
-    const token = await getAccessToken();
-    const endpoint = isEmail ? EMAIL_API_ENDPOINT : SMS_API_ENDPOINT;
-
-    log("INFO", `${isEmail ? "Email" : "SMS"} sending...`, payload);
-
-    const response = await axios.post(endpoint, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    log("SUCCESS", `${isEmail ? "Email" : "SMS"} sent successfully`, response.data);
-    return response.data;
   } catch (err) {
-    log("ERROR", "Notification sending failed", err.response?.data || err.message);
+    await logToKafka("ERROR", "Failed to fetch SFMC token", { error: err.message });
     throw err;
   }
-};
+}
 
-const processMessage = async (message) => {
+// Push Notification Sender
+async function sendNotification(payload, isEmail = true) {
+  const token = await getAccessToken();
+  const endpoint = isEmail ? EMAIL_API_ENDPOINT : SMS_API_ENDPOINT;
+
+  await logToKafka("INFO", "Sending notification request to SFMC", { endpoint, payload });
+
+  const response = await axios.post(endpoint, payload, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  await logToKafka("INFO", "SFMC response received", response.data);
+  return response.data;
+}
+
+// Kafka → Handles async messages
+async function processKafkaMessage(message) {
   try {
-    const jsonString = message.value.toString();
-    log("INFO", `Kafka Message Received => ${jsonString}`);
-
-    const data = JSON.parse(jsonString);
+    const data = JSON.parse(message.value.toString());
     const { alertId, contact_number, email, name, date, time, reg_no } = data;
 
-    let payload;
-    let isEmail = true;
+    await logToKafka("INFO", "Kafka Notification trigger received", data);
 
-    switch (alertId) {
-      case "001":
-        payload = {
-          definitionKey: "Worry_free_service",
-          recipients: [
-            {
-              contactKey: contact_number,
-              to: email,
-              attributes: {
-                SubscriberKey: contact_number,
-                EmailAddress: email,
-                CUSTOMERNAME: name,
-                DEALERNAME: "RE INDIA",
-                DATE: date,
-                TIME: time,
-              },
-            },
-          ],
-        };
-        break;
+    let payload, isEmail = true;
 
-      case "003":
-        if (!contact_number) throw new Error("Missing contact number");
-
-        const otp = generateOTP();
-        log("INFO", `Generated OTP: ${otp} → ${contact_number}`);
-
-        payload = {
-          Subscribers: [
-            {
-              MobileNumber: contact_number,
+    if (alertId === "001") {
+      payload = {
+        definitionKey: "Worry_free_service",
+        recipients: [
+          {
+            contactKey: contact_number,
+            to: email,
+            attributes: {
               SubscriberKey: contact_number,
-              Attributes: { OTPNUMBER: otp },
+              EmailAddress: email,
+              CUSTOMERNAME: name,
+              DEALERNAME: "RE INDIA",
+              DATE: date,
+              TIME: time,
             },
-          ],
-          Subscribe: "true",
-          Resubscribe: "true",
-          keyword: "RE",
-          Override: "false",
-        };
-        isEmail = false;
-        break;
+          },
+        ],
+      };
+    } else if (alertId === "003") {
+      const otp = otpGenerator();
+      await logToKafka("INFO", "Generated OTP", { contact_number, otp });
 
-      default:
-        throw new Error(`Unsupported alertId: ${alertId}`);
+      payload = {
+        Subscribers: [{ MobileNumber: contact_number, SubscriberKey: contact_number, Attributes: { OTPNUMBER: otp }}],
+        Subscribe: "true",
+        Resubscribe: "true",
+        keyword: "RE",
+        Override: "false",
+      };
+      isEmail = false;
+    } else {
+      throw new Error(`Unsupported alertId: ${alertId}`);
     }
 
     await sendNotification(payload, isEmail);
-  } catch (error) {
-    log("ERROR", "Processing Kafka message failed", error.toString());
+    await logToKafka("SUCCESS", "Notification delivered successfully", data);
+  } catch (err) {
+    await logToKafka("ERROR", "Processing Kafka message failed", { error: err.message });
   }
-};
+}
 
-// Kafka Listener
-const startKafkaProcessing = async () => {
+// Kafka Listener Service
+(async () => {
   try {
     await consumer.connect();
-    await consumer.subscribe({ topic: SOURCE_TOPIC, fromBeginning: false });
-    await consumer.run({
-      eachMessage: async ({ topic, partition, message }) => {
-        log("INFO", `Processing message from ${topic}:${partition}`);
-        await processMessage(message);
-      },
-    });
-    log("INFO", "Kafka Listening Started 🎯");
-  } catch (error) {
-    log("ERROR", "Kafka processing failed", error.toString());
-  }
-};
+    await consumer.subscribe({ topic: process.env.SOURCE_TOPIC || "alert_input_test", fromBeginning: false });
 
-// Express API
+    await consumer.run({
+      eachMessage: async ({ message }) => await processKafkaMessage(message),
+    });
+
+    await logToKafka("INFO", "Kafka listener running");
+  } catch (err) {
+    await logToKafka("ERROR", "Kafka listener startup failed", { error: err.message });
+  }
+})();
+
+// ---------- REST API Layer (direct-trigger testing) ----------
 const app = express();
 app.use(bodyParser.json());
 
 app.post("/notify-service", async (req, res) => {
-  console.log("---- Incoming API Request ----");
-  console.log(JSON.stringify(req.body, null, 2));
-
-  const { alertId, contact_number, email, name, date, time, reg_no } = req.body;
-
-  if (!alertId) {
-    console.log("❌ Error: alertId missing");
-    return res.status(400).json({ error: "alertId is mandatory" });
-  }
+  const body = req.body;
+  await logToKafka("INFO", "API Notification Trigger Received", body);
 
   try {
-    let response;
-
-    if (alertId === "001") {
-      if (!email || !name || !contact_number || !date || !time) {
-        console.log("❌ Missing required fields for Email type");
-        return res.status(400).json({ error: "Missing required fields" });
-      }
-
-      console.log("📩 Sending Email Notification...");
-      response = await sendNotification(
-        {
-          definitionKey: "Worry_free_service",
-          recipients: [
-            {
-              contactKey: contact_number,
-              to: email,
-              attributes: {
-                SubscriberKey: contact_number,
-                EmailAddress: email,
-                CUSTOMERNAME: name,
-                DEALERNAME: "RE INDIA",
-                DATE: date,
-                TIME: time,
-              },
-            },
-          ],
-        },
-        true
-      );
-    } else if (alertId === "003") {
-      if (!contact_number) {
-        console.log("❌ Missing contact number for SMS");
-        return res.status(400).json({ error: "contact_number required" });
-      }
-
-      console.log("📲 Sending SMS OTP...");
-      response = await sendNotification(
-        {
-          Subscribers: [
-            {
-              MobileNumber: contact_number,
-              SubscriberKey: contact_number,
-              Attributes: {
-                OTPNUMBER: generateOTP(),
-              },
-            },
-          ],
-          Subscribe: "true",
-          Resubscribe: "true",
-          keyword: "RE",
-          Override: "false",
-        },
-        false
-      );
-    } else {
-      return res.status(400).json({
-        error: `Unknown alertId: ${alertId}`,
-      });
-    }
-
-    console.log("✅ Notification sent successfully!");
-    console.log("SFMC Response:", JSON.stringify(response));
-
-    res.json({
-      status: "SUCCESS",
-      message: "Notification delivered",
-      sfmc: response,
-    });
-
+    await processKafkaMessage({ value: Buffer.from(JSON.stringify(body)) });
+    res.json({ status: "SUCCESS", message: "Notification pushed" });
   } catch (err) {
-    console.error("❌ Notification failure:", err.message);
-    res.status(500).json({
-      status: "FAILED",
-      error: err.message,
-    });
+    await logToKafka("ERROR", "API trigger failed", { error: err.message });
+    res.status(500).json({ status: "FAILED", error: err.message });
   }
 });
-// Debug / Monitoring Endpoints
-app.get("/health", (req, res) => {
-  res.json({
-    status: "UP",
-    timestamp: new Date().toISOString(),
-  });
-});
 
-app.get("/version", (req, res) => {
-  res.json({
-    version: process.env.APP_VERSION || "v1.0.0",
-    deployedAt: process.env.DEPLOYED_AT || new Date().toISOString()
-  });
-});
+// Health Checks
+app.get("/health", (_, res) => res.json({ status: "OK", time: new Date().toISOString() }));
+app.get("/version", (_, res) => res.json({ version: "1.0.0" }));
 
-
-// Server Start
 const PORT = process.env.PORT || 3008;
-app.listen(PORT, () => log("SUCCESS", `API Running on port ${PORT}`));
-startKafkaProcessing();
+app.listen(PORT, () => log("Server listening on port", PORT));
