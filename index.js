@@ -267,6 +267,20 @@ app.post("/notify-service", async (req, res) => {
     });
   }
 });
+// Debug / Monitoring Endpoints
+app.get("/health", (req, res) => {
+  res.json({
+    status: "UP",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/version", (req, res) => {
+  res.json({
+    version: process.env.APP_VERSION || "v1.0.0",
+    deployedAt: process.env.DEPLOYED_AT || new Date().toISOString()
+  });
+});
 
 
 // Server Start
