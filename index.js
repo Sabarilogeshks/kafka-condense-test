@@ -25,7 +25,7 @@ const TOKEN_ENDPOINT =
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
-const DEFAULT_EMAIL = "schetan@royalenfield.com";
+const DEFAULT_EMAIL = "kaliappan_ext@royalenfield.com";
 
 let cachedToken = null;
 let tokenExpiry = null;
