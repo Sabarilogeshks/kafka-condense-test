@@ -4,6 +4,16 @@ const axios = require("axios");
 const express = require("express");
 const bodyParser = require("body-parser");
 
+// Logging helper
+const log = (type, msg, obj = null) => {
+  const ts = new Date().toISOString();
+  if (obj) {
+    console.log(`[${ts}] [${type}] ${msg}`, obj);
+  } else {
+    console.log(`[${ts}] [${type}] ${msg}`);
+  }
+};
+
 const KAFKA_BROKER = process.env.KAFKA_BROKER || "localhost:9092";
 const SOURCE_TOPIC = process.env.SOURCE_TOPIC || "notification-topic";
 const EMAIL_API_ENDPOINT =
@@ -12,16 +22,15 @@ const SMS_API_ENDPOINT =
   "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.rest.marketingcloudapis.com/sms/v1/messageContact/NzcwMzo3ODow/send";
 const TOKEN_ENDPOINT =
   "https://mc3snfg-sfh7x8jmy5gw1rdk4zbq.auth.marketingcloudapis.com/v2/token";
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
-const DEFAULT_EMAIL = "kaliappan_ext@royalenfield.com";
+const DEFAULT_EMAIL = "schetan@royalenfield.com";
 
 let cachedToken = null;
 let tokenExpiry = null;
 
-const generateOTP = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-};
+const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 const getAccessToken = async (retryCount = 0) => {
   try {
@@ -40,19 +49,16 @@ const getAccessToken = async (retryCount = 0) => {
         client_id: process.env.CLIENT_ID,
         client_secret: process.env.CLIENT_SECRET,
       },
-      {
-        headers: { "Content-Type": "application/json" },
-      }
+      { headers: { "Content-Type": "application/json" } }
     );
-
-    if (!response.data?.access_token) {
-      throw new Error("Invalid token response");
-    }
 
     cachedToken = response.data.access_token;
     tokenExpiry = Date.now() + (response.data.expires_in - 1200) * 1000;
+
+    log("INFO", "New SFMC access token generated");
     return cachedToken;
   } catch (error) {
+    log("ERROR", "Token fetch failed", error.toString());
     if (retryCount < MAX_RETRIES) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
       return getAccessToken(retryCount + 1);
@@ -62,29 +68,37 @@ const getAccessToken = async (retryCount = 0) => {
 };
 
 // Kafka setup
-const kafka = new Kafka({
-  clientId: "notification-processor",
-  brokers: [KAFKA_BROKER],
-});
-
+const kafka = new Kafka({ clientId: "notification-processor", brokers: [KAFKA_BROKER] });
 const consumer = kafka.consumer({ groupId: "notification-group" });
 
 const sendNotification = async (payload, isEmail = true) => {
-  const token = await getAccessToken();
-  const endpoint = isEmail ? EMAIL_API_ENDPOINT : SMS_API_ENDPOINT;
+  try {
+    const token = await getAccessToken();
+    const endpoint = isEmail ? EMAIL_API_ENDPOINT : SMS_API_ENDPOINT;
 
-  const response = await axios.post(endpoint, payload, {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  return response.data;
+    log("INFO", `${isEmail ? "Email" : "SMS"} sending...`, payload);
+
+    const response = await axios.post(endpoint, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    log("SUCCESS", `${isEmail ? "Email" : "SMS"} sent successfully`, response.data);
+    return response.data;
+  } catch (err) {
+    log("ERROR", "Notification sending failed", err.response?.data || err.message);
+    throw err;
+  }
 };
 
 const processMessage = async (message) => {
   try {
-    const data = JSON.parse(message.value.toString());
+    const jsonString = message.value.toString();
+    log("INFO", `Kafka Message Received => ${jsonString}`);
+
+    const data = JSON.parse(jsonString);
     const { alertId, contact_number, email, name, date, time, reg_no } = data;
 
     let payload;
@@ -92,9 +106,6 @@ const processMessage = async (message) => {
 
     switch (alertId) {
       case "001":
-        if (!date || !time || !email || !name) {
-          throw new Error("Missing required fields for service notification");
-        }
         payload = {
           definitionKey: "Worry_free_service",
           recipients: [
@@ -114,43 +125,18 @@ const processMessage = async (message) => {
         };
         break;
 
-      case "002":
-        if (!reg_no || !email || !name) {
-          throw new Error("Missing required fields for OTA notification");
-        }
-        payload = {
-          definitionKey: "OTA _FOTA",
-          recipients: [
-            {
-              contactKey: contact_number,
-              to: email,
-              attributes: {
-                SubscriberKey: contact_number,
-                EmailAddress: email,
-                REGISTRATIONNUMBER: reg_no,
-                Contact_Key: contact_number,
-                CUSTOMERNAME: name,
-              },
-            },
-          ],
-        };
-        break;
-
       case "003":
-        if (!contact_number) {
-          throw new Error("Missing contact number for SMS notification");
-        }
+        if (!contact_number) throw new Error("Missing contact number");
+
         const otp = generateOTP();
-        console.log(`Generated OTP for ${contact_number}: ${otp}`);
+        log("INFO", `Generated OTP: ${otp} → ${contact_number}`);
 
         payload = {
           Subscribers: [
             {
               MobileNumber: contact_number,
               SubscriberKey: contact_number,
-              Attributes: {
-                OTPNUMBER: otp,
-              },
+              Attributes: { OTPNUMBER: otp },
             },
           ],
           Subscribe: "true",
@@ -165,83 +151,51 @@ const processMessage = async (message) => {
         throw new Error(`Unsupported alertId: ${alertId}`);
     }
 
-    if (payload) {
-      const response = await sendNotification(payload, isEmail);
-      console.log(
-        `${isEmail ? "Email" : "SMS"} sent successfully for alertId: ${alertId}`
-      );
-      return response;
-    }
+    await sendNotification(payload, isEmail);
   } catch (error) {
-    console.error("Error processing message:", error);
-    throw error;
+    log("ERROR", "Processing Kafka message failed", error.toString());
   }
 };
 
+// Kafka Listener
 const startKafkaProcessing = async () => {
   try {
     await consumer.connect();
     await consumer.subscribe({ topic: SOURCE_TOPIC, fromBeginning: false });
     await consumer.run({
-      eachMessage: async ({ message }) => {
+      eachMessage: async ({ topic, partition, message }) => {
+        log("INFO", `Processing message from ${topic}:${partition}`);
         await processMessage(message);
       },
     });
+    log("INFO", "Kafka Listening Started 🎯");
   } catch (error) {
-    console.error("Error in Kafka processing:", error);
+    log("ERROR", "Kafka processing failed", error.toString());
   }
 };
 
-// Express setup
+// Express API
 const app = express();
 app.use(bodyParser.json());
 
 app.post("/notify-service", async (req, res) => {
-  try {
-    const { url, contact, sessionId } = req.body;
+  log("INFO", "API Request Received", req.body);
 
-    if (!url || !contact || !sessionId) {
-      return res.status(400).json({
-        error: "Missing required fields: url, contact, or sessionId",
-      });
-    }
+  const { contact } = req.body;
 
-    const payload = {
-      definitionKey: "Worry_free_service",
-      recipients: [
-        {
-          contactKey: contact,
-          to: DEFAULT_EMAIL,
-          attributes: {
-            SubscriberKey: contact,
-            EmailAddress: DEFAULT_EMAIL,
-            CUSTOMERNAME: sessionId,
-            DEALERNAME: url,
-            DATE: "date",
-            TIME: "time",
-          },
-        },
-      ],
-    };
-
-    const response = await sendNotification(payload, true);
-    res.json({
-      message: "Email notification sent successfully",
-      data: response,
-    });
-  } catch (error) {
-    console.error("Error sending notification:", error);
-    res.status(500).json({
-      error: "Failed to send notification",
-      details: error.message,
-    });
+  if (!contact) {
+    log("WARN", "Missing contact in API request");
+    return res.status(400).json({ error: "contact is required" });
   }
+
+  await consumer.emitMessage({
+    value: JSON.stringify({ ...req.body, alertId: "001" }),
+  });
+
+  res.json({ message: "Notification request received successfully" });
 });
 
-// Start Express server
+// Server Start
 const PORT = process.env.PORT || 3008;
-app.listen(PORT, () => {
-  console.log(`API server running on port ${PORT}`);
-});
-
-startKafkaProcessing().catch(console.error);
+app.listen(PORT, () => log("SUCCESS", `API Running on port ${PORT}`));
+startKafkaProcessing();
