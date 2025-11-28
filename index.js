@@ -82,17 +82,20 @@ const sendNotification = async (payload, isEmail = true) => {
   return response.data;
 };
 
-const buildPayload = (data) => {
-  const { alertId, contact_number, email, name, date, time, reg_no } = data;
+const processMessage = async (message) => {
+  try {
+    const data = JSON.parse(message.value.toString());
+    const { alertId, contact_number, email, name, date, time, reg_no } = data;
 
-  switch (alertId) {
-    case "001": // Email - Service Notification
-      if (!date || !time || !email || !name)
-        throw new Error("001 - Missing date/time/email/name");
+    let payload;
+    let isEmail = true;
 
-      return {
-        isEmail: true,
-        payload: {
+    switch (alertId) {
+      case "001":
+        if (!date || !time || !email || !name) {
+          throw new Error("Missing required fields for service notification");
+        }
+        payload = {
           definitionKey: "Worry_free_service",
           recipients: [
             {
@@ -108,17 +111,15 @@ const buildPayload = (data) => {
               },
             },
           ],
-        },
-      };
+        };
+        break;
 
-    case "002": // Email - OTA Notification
-      if (!reg_no || !email || !name)
-        throw new Error("002 - Missing reg_no/email/name");
-
-      return {
-        isEmail: true,
-        payload: {
-          definitionKey: "OTA_FOTA",
+      case "002":
+        if (!reg_no || !email || !name) {
+          throw new Error("Missing required fields for OTA notification");
+        }
+        payload = {
+          definitionKey: "OTA _FOTA",
           recipients: [
             {
               contactKey: contact_number,
@@ -127,65 +128,55 @@ const buildPayload = (data) => {
                 SubscriberKey: contact_number,
                 EmailAddress: email,
                 REGISTRATIONNUMBER: reg_no,
+                Contact_Key: contact_number,
                 CUSTOMERNAME: name,
               },
             },
           ],
-        },
-      };
+        };
+        break;
 
-    case "003": // SMS - OTP
-      if (!contact_number)
-        throw new Error("003 - Missing contact_number");
+      case "003":
+        if (!contact_number) {
+          throw new Error("Missing contact number for SMS notification");
+        }
+        const otp = generateOTP();
+        console.log(`Generated OTP for ${contact_number}: ${otp}`);
 
-      const otp = generateOTP();
-      console.log(`🔐 OTP generated: ${otp} for ${contact_number}`);
-
-      return {
-        isEmail: false,
-        payload: {
+        payload = {
           Subscribers: [
             {
               MobileNumber: contact_number,
               SubscriberKey: contact_number,
-              Attributes: { OTPNUMBER: otp },
+              Attributes: {
+                OTPNUMBER: otp,
+              },
             },
           ],
           Subscribe: "true",
           Resubscribe: "true",
           keyword: "RE",
           Override: "false",
-        },
-      };
+        };
+        isEmail = false;
+        break;
 
-    default:
-      throw new Error(`Unsupported alertId: ${alertId}`);
+      default:
+        throw new Error(`Unsupported alertId: ${alertId}`);
+    }
+
+    if (payload) {
+      const response = await sendNotification(payload, isEmail);
+      console.log(
+        `${isEmail ? "Email" : "SMS"} sent successfully for alertId: ${alertId}`
+      );
+      return response;
+    }
+  } catch (error) {
+    console.error("Error processing message:", error);
+    throw error;
   }
 };
-
-
-const processMessage = async (message) => {
-  const msgId = message.offset; // for reference tracking
-
-  try {
-    const data = JSON.parse(message.value.toString());
-
-    console.log(`📩 Kafka Event → alertId=${data.alertId} offset=${msgId}`);
-
-    const { payload, isEmail } = buildPayload(data);
-
-    const resp = await sendNotification(payload, isEmail);
-
-    console.log(
-      `✅ ${
-        isEmail ? "Email" : "SMS"
-      } Sent Successfully | requestId=${resp.requestId} | offset=${msgId}`
-    );
-  } catch (err) {
-    console.error(`❌ Kafka Event Failed | offset=${msgId} | ${err.message}`);
-  }
-};
-
 
 const startKafkaProcessing = async () => {
   try {
