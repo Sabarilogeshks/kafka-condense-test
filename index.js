@@ -179,21 +179,95 @@ const app = express();
 app.use(bodyParser.json());
 
 app.post("/notify-service", async (req, res) => {
-  log("INFO", "API Request Received", req.body);
+  console.log("---- Incoming API Request ----");
+  console.log(JSON.stringify(req.body, null, 2));
 
-  const { contact } = req.body;
+  const { alertId, contact_number, email, name, date, time, reg_no } = req.body;
 
-  if (!contact) {
-    log("WARN", "Missing contact in API request");
-    return res.status(400).json({ error: "contact is required" });
+  if (!alertId) {
+    console.log("❌ Error: alertId missing");
+    return res.status(400).json({ error: "alertId is mandatory" });
   }
 
-  await consumer.emitMessage({
-    value: JSON.stringify({ ...req.body, alertId: "001" }),
-  });
+  try {
+    let response;
 
-  res.json({ message: "Notification request received successfully" });
+    if (alertId === "001") {
+      if (!email || !name || !contact_number || !date || !time) {
+        console.log("❌ Missing required fields for Email type");
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+
+      console.log("📩 Sending Email Notification...");
+      response = await sendNotification(
+        {
+          definitionKey: "Worry_free_service",
+          recipients: [
+            {
+              contactKey: contact_number,
+              to: email,
+              attributes: {
+                SubscriberKey: contact_number,
+                EmailAddress: email,
+                CUSTOMERNAME: name,
+                DEALERNAME: "RE INDIA",
+                DATE: date,
+                TIME: time,
+              },
+            },
+          ],
+        },
+        true
+      );
+    } else if (alertId === "003") {
+      if (!contact_number) {
+        console.log("❌ Missing contact number for SMS");
+        return res.status(400).json({ error: "contact_number required" });
+      }
+
+      console.log("📲 Sending SMS OTP...");
+      response = await sendNotification(
+        {
+          Subscribers: [
+            {
+              MobileNumber: contact_number,
+              SubscriberKey: contact_number,
+              Attributes: {
+                OTPNUMBER: generateOTP(),
+              },
+            },
+          ],
+          Subscribe: "true",
+          Resubscribe: "true",
+          keyword: "RE",
+          Override: "false",
+        },
+        false
+      );
+    } else {
+      return res.status(400).json({
+        error: `Unknown alertId: ${alertId}`,
+      });
+    }
+
+    console.log("✅ Notification sent successfully!");
+    console.log("SFMC Response:", JSON.stringify(response));
+
+    res.json({
+      status: "SUCCESS",
+      message: "Notification delivered",
+      sfmc: response,
+    });
+
+  } catch (err) {
+    console.error("❌ Notification failure:", err.message);
+    res.status(500).json({
+      status: "FAILED",
+      error: err.message,
+    });
+  }
 });
+
 
 // Server Start
 const PORT = process.env.PORT || 3008;
