@@ -2,163 +2,268 @@ require("dotenv").config();
 const { Kafka } = require("kafkajs");
 const axios = require("axios");
 const express = require("express");
+const bodyParser = require("body-parser");
 
-// Optional (for OTP verification later)
-// const Redis = require("ioredis");
-// const redis = new Redis(process.env.REDIS_URL);
+// ───────────────────────── CONFIGS ────────────────────────────────
+const KAFKA_BROKER = process.env.KAFKA_BROKER;
+const SOURCE_TOPIC = process.env.SOURCE_TOPIC;
+const LOG_TOPIC = process.env.LOG_TOPIC;
 
-// ─────────────────────────── CONFIG ──────────────────────────────
-const {
-  KAFKA_BROKER,
-  SOURCE_TOPIC,
-  LOG_TOPIC,
-  SFMC_EMAIL_URL,
-  SFMC_SMS_URL,
-  SFMC_TOKEN_URL,
-  CLIENT_ID,
-  CLIENT_SECRET,
-  PORT = 3008
-} = process.env;
+const EMAIL_API_ENDPOINT = process.env.SFMC_EMAIL_URL;
+const SMS_API_ENDPOINT = process.env.SFMC_SMS_URL;
+const TOKEN_ENDPOINT = process.env.SFMC_TOKEN_URL;
+
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const DEFAULT_EMAIL = process.env.DEFAULT_EMAIL || "kaliappan_ext@royalenfield.com";
+
+const PORT = process.env.PORT || 3008;
 
 let cachedToken = null;
 let tokenExpiry = null;
 
-// ───────────────────────── LOG FUNCTION ──────────────────────────
-const logToKafka = async (level, message, meta = {}) => {
-  const event = { timestamp: new Date(), level, message, ...meta };
-  console.log(`[${level}]`, message, meta);
+// ───────────────────────── KAFKA SETUP ───────────────────────────
+const kafka = new Kafka({ clientId: "notification-service", brokers: [KAFKA_BROKER] });
+const consumer = kafka.consumer({ groupId: "notification-group" });
+const producer = kafka.producer();
 
+// ───────────────────────── LOG WRAPPER ────────────────────────────
+const logToKafka = async (level, message, extra = {}) => {
   try {
+    const event = {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...extra
+    };
+
     await producer.send({
       topic: LOG_TOPIC,
-      messages: [{ value: JSON.stringify(event) }]
+      messages: [{ value: JSON.stringify(event) }],
     });
+
+    console.log(`[${level}] ${message}`, extra);
   } catch (err) {
-    console.error("⚠ Failed to push logs to Kafka:", err.message);
+    console.error("Logging Failure:", err.message);
   }
 };
 
-// ───────────────────────── TOKEN MANAGEMENT ──────────────────────
-async function getAccessToken() {
+// ───────────────────────── TOKEN LOGIC ────────────────────────────
+const getAccessToken = async () => {
   if (cachedToken && tokenExpiry > Date.now()) return cachedToken;
 
-  try {
-    const res = await axios.post(
-      SFMC_TOKEN_URL,
-      { grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET },
-      { headers: { "Content-Type": "application/json" } }
-    );
+  const tokenResponse = await axios.post(
+    TOKEN_ENDPOINT,
+    { grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET },
+    { headers: { "Content-Type": "application/json" } }
+  );
 
-    cachedToken = res.data.access_token;
-    tokenExpiry = Date.now() + (res.data.expires_in - 180) * 1000; // Refresh 3 mins before expiry
+  cachedToken = tokenResponse.data.access_token;
+  tokenExpiry = Date.now() + (tokenResponse.data.expires_in - 120) * 1000;
 
-    await logToKafka("INFO", "🔐 SFMC token refreshed");
-    return cachedToken;
+  await logToKafka("INFO", "New SFMC token generated");
+  return cachedToken;
+};
 
-  } catch (err) {
-    await logToKafka("ERROR", "Token generation failed", { err: err.message });
-    throw new Error("SFMC Token fetch failed");
-  }
-}
-
-// ───────────────────────── NOTIFICATION SENDER ───────────────────
-async function sendNotification(payload, isEmail = true, retry = 2) {
+// ───────────────────────── API SEND FUNCTION ──────────────────────
+const sendNotification = async (payload, isEmail = true) => {
   const token = await getAccessToken();
-  const url = isEmail ? SFMC_EMAIL_URL : SFMC_SMS_URL;
+  const endpoint = isEmail ? EMAIL_API_ENDPOINT : SMS_API_ENDPOINT;
 
+  await logToKafka("INFO", `Sending ${isEmail ? "Email" : "SMS"}`, payload);
+
+  const response = await axios.post(endpoint, payload, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  await logToKafka("SUCCESS", `${isEmail ? "Email" : "SMS"} delivered`, response.data);
+  return response.data;
+};
+
+// ───────────────────────── ALERT TEMPLATE CONFIG ──────────────────
+// alertId = decides CONTENT
+// Channel = decides where to send (SMS / Email / Both)
+const ALERT_TEMPLATES = {
+  /**
+   * alertId: "001" – Live location share
+   * Example Params:
+   *  {
+   *    "Channel":"SMS" | "Email" | "Both",
+   *    "alertId":"001",
+   *    "contact_number":"919655771145",
+   *    "email":"xyz@abc.com",
+   *    "Params": { "Name":"Sabari", "url":"https://..." }
+   *  }
+   */
+  "001": {
+    name: "Live location share",
+    buildContent: (data) => {
+      if (!data.Params || !data.Params.Name || !data.Params.url) {
+        throw new Error("Params.Name and Params.url are required for alertId 001");
+      }
+
+      const smsText = `${data.Params.Name} has shared live location with you. Click the link to track the location ${data.Params.url}`;
+
+      return {
+        sms: {
+          keyword: "RELOC",
+          attributes: {
+            MESSAGE_TEXT: smsText // Use %%MESSAGE_TEXT%% in SFMC SMS template
+          }
+        },
+        email: {
+          definitionKey: "LIVE_LOCATION_EMAIL_TEMPLATE", // configure in SFMC
+          attributes: {
+            NAME: data.Params.Name,
+            URL: data.Params.url
+          }
+        }
+      };
+    }
+  },
+
+  /**
+   * alertId: "002" – OTP content
+   * Example:
+   *  {
+   *    "Channel":"SMS" | "Email" | "Both",
+   *    "alertId":"002",
+   *    "contact_number":"919655771145",
+   *    "email":"xyz@abc.com"
+   *  }
+   */
+  "002": {
+    name: "OTP verification",
+    buildContent: (data) => {
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const smsText = `Your OTP is ${otp}. Please do not share it with anyone.`;
+
+      return {
+        sms: {
+          keyword: "REOTP",
+          attributes: {
+            OTPNUMBER: otp // Use %%OTPNUMBER%% in SMS template
+          }
+        },
+        email: {
+          definitionKey: "OTP_EMAIL_TEMPLATE", // configure in SFMC
+          attributes: {
+            OTP: otp // Use %%OTP%% in email template
+          }
+        },
+        meta: { otp }
+      };
+    }
+  },
+
+  // Example: you can easily add more alerts like old Worry_free_service here:
+  // "003": {
+  //   name: "Worry free service",
+  //   buildContent: (data) => ({
+  //     email: {
+  //       definitionKey: "Worry_free_service",
+  //       attributes: {
+  //         SubscriberKey: data.contact_number,
+  //         EmailAddress: data.email,
+  //         CUSTOMERNAME: data.name,
+  //         DEALERNAME: "RE INDIA",
+  //         DATE: data.date,
+  //         TIME: data.time
+  //       }
+  //     }
+  //   })
+  // }
+};
+
+// ───────────────────────── HELPERS FOR PAYLOADS ───────────────────
+const buildSmsPayload = (contactNumber, smsConfig) => {
+  if (!contactNumber) {
+    throw new Error("contact_number is required for SMS channel");
+  }
+
+  return {
+    Subscribers: [{
+      MobileNumber: contactNumber,
+      SubscriberKey: contactNumber,
+      Attributes: smsConfig.attributes
+    }],
+    Subscribe: true,
+    Resubscribe: true,
+    keyword: smsConfig.keyword || "RE"
+  };
+};
+
+const buildEmailPayload = (contactNumber, email, emailConfig) => {
+  const toEmail = email || DEFAULT_EMAIL;
+
+  if (!toEmail) {
+    throw new Error("Email is required for Email channel");
+  }
+
+  return {
+    definitionKey: emailConfig.definitionKey,
+    recipients: [{
+      contactKey: contactNumber || toEmail,
+      to: toEmail,
+      attributes: emailConfig.attributes
+    }]
+  };
+};
+
+// ───────────────────────── MESSAGE HANDLER ────────────────────────
+const processMessage = async (data) => {
   try {
-    const res = await axios.post(url, payload, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    await logToKafka("INFO", "Message received", data);
 
-    await logToKafka("SUCCESS", `${isEmail ? "Email" : "SMS"} sent`, res.data);
-    return res.data;
-
-  } catch (err) {
-    await logToKafka("ERROR", "SFMC Send Failed", { err: err.message, retry });
-
-    // Retry with new token
-    if (retry > 0) {
-      cachedToken = null;
-      return sendNotification(payload, isEmail, retry - 1);
+    const alertDef = ALERT_TEMPLATES[data.alertId];
+    if (!alertDef) {
+      throw new Error(`Invalid or unsupported alertId: ${data.alertId}`);
     }
 
-    throw err;
-  }
-}
+    const channel = (data.Channel || "Email").toUpperCase(); // SMS | EMAIL | BOTH
+    const { sms, email, meta } = alertDef.buildContent(data);
 
-// ───────────────────────── MESSAGE HANDLER ───────────────────────
-function buildPayload(data) {
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    let smsResult = null;
+    let emailResult = null;
 
-  switch (data.alertId) {
-    case "001": // EMAIL TEMPLATE
-      return {
-        payload: {
-          definitionKey: "Worry_free_service",
-          recipients: [{
-            contactKey: data.contact_number,
-            to: data.email,
-            attributes: {
-              SubscriberKey: data.contact_number,
-              EmailAddress: data.email,
-              CUSTOMERNAME: data.name,
-              DEALERNAME: "RE INDIA",
-              DATE: data.date,
-              TIME: data.time
-            }
-          }]
-        },
-        isEmail: true
-      };
+    // SMS
+    if (channel === "SMS" || channel === "BOTH") {
+      if (!sms) {
+        throw new Error(`SMS content not configured for alertId: ${data.alertId}`);
+      }
+      const smsPayload = buildSmsPayload(data.contact_number, sms);
+      smsResult = await sendNotification(smsPayload, false);
+    }
 
-    case "003": // OTP SMS TEMPLATE
-      return {
-        payload: {
-          Subscribers: [{
-            MobileNumber: data.contact_number,
-            SubscriberKey: data.contact_number,
-            Attributes: { OTPNUMBER: otp }
-          }],
-          Subscribe: true,
-          Resubscribe: true,
-          keyword: "RE"
-        },
-        isEmail: false,
-        otp
-      };
+    // EMAIL
+    if (channel === "EMAIL" || channel === "BOTH") {
+      if (!email) {
+        throw new Error(`Email content not configured for alertId: ${data.alertId}`);
+      }
+      const emailPayload = buildEmailPayload(data.contact_number, data.email, email);
+      emailResult = await sendNotification(emailPayload, true);
+    }
 
-    default:
-      throw new Error("Unsupported alertId");
-  }
-}
+    await logToKafka("SUCCESS", "Notification processed", {
+      alertId: data.alertId,
+      channel,
+      smsSent: !!smsResult,
+      emailSent: !!emailResult
+    });
 
-async function processMessage(data) {
-  try {
-    const { payload, isEmail, otp } = buildPayload(data);
-
-    await logToKafka("INFO", "Processing notification", data);
-    const result = await sendNotification(payload, isEmail);
-
-    // OTP save example
-    // if (!isEmail) await redis.setex(`OTP:${data.contact_number}`, 300, otp);
-
-    return result;
+    return { smsResult, emailResult, meta };
 
   } catch (err) {
-    await logToKafka("ERROR", "Processing failed", { data, error: err.message });
+    await logToKafka("ERROR", "Notification failed", { error: err.message, data });
     throw err;
   }
-}
+};
 
-// ───────────────────────── KAFKA SETUP ───────────────────────────
-const kafka = new Kafka({ clientId: "notification-service", brokers: [KAFKA_BROKER] });
-const consumer = kafka.consumer({ groupId: "notif-consumers" });
-const producer = kafka.producer();
-
-async function startKafka() {
+// ───────────────────────── START CONSUMER ─────────────────────────
+const startKafkaProcessing = async () => {
   await producer.connect();
   await consumer.connect();
+
   await consumer.subscribe({ topic: SOURCE_TOPIC });
 
   await consumer.run({
@@ -166,37 +271,39 @@ async function startKafka() {
       try {
         const data = JSON.parse(message.value.toString());
         await processMessage(data);
-      } catch (e) {
-        await logToKafka("ERROR", "Invalid Kafka message", { raw: message.value.toString() });
+      } catch (err) {
+        await logToKafka("ERROR", "Kafka message processing error", {
+          error: err.message,
+          raw: message.value.toString()
+        });
       }
-    }
+    },
   });
 
-  await logToKafka("INFO", "Kafka listener running...");
-}
+  await logToKafka("INFO", "Kafka listener running");
+};
 
-// ───────────────────────── EXPRESS API ───────────────────────────
+// ───────────────────────── EXPRESS API ────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-app.post("/notify", async (req, res) => {
+app.post("/notify-service", async (req, res) => {
+  await logToKafka("INFO", "HTTP API Request Received", req.body);
+
   try {
-    await processMessage(req.body);
-    res.json({ status: "SUCCESS" });
-  } catch (err) {
-    res.status(500).json({ status: "FAILED", error: err.message });
+    const result = await processMessage(req.body);
+    res.json({ status: "SUCCESS", message: "Notification processed", result });
+  } catch (error) {
+    res.status(500).json({ status: "FAILED", error: error.message });
   }
 });
 
-app.get("/health", (_, res) => res.json({ status: "UP" }));
+app.get("/health", (req, res) => res.json({ status: "UP" }));
+app.get("/version", (req, res) => res.json({ version: "v1.0.0" }));
 
-app.listen(PORT, () => console.log(`🚀 API running on port ${PORT}`));
-startKafka();
+// ───────────────────────── START SERVER ───────────────────────────
+app.listen(PORT, () => console.log(`API running on ${PORT}`));
 
-// Graceful Shutdown
-process.on("SIGTERM", async () => {
-  console.log("Shutting down...");
-  await consumer.disconnect();
-  await producer.disconnect();
-  process.exit(0);
+startKafkaProcessing().catch((err) => {
+  console.error("Kafka startup error:", err.message);
 });
